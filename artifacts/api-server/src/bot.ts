@@ -41,6 +41,12 @@ const commands = [
     .addStringOption((o) =>
       o.setName("link").setDescription("The URL to extract CSS from").setRequired(true)
     ),
+  new SlashCommandBuilder()
+    .setName("assets")
+    .setDescription("Lists all asset URLs (images, fonts, videos, icons, audio) found on a page")
+    .addStringOption((o) =>
+      o.setName("link").setDescription("The URL to scan for assets").setRequired(true)
+    ),
 ].map((cmd) => cmd.toJSON());
 
 async function registerCommands(clientId: string): Promise<void> {
@@ -77,21 +83,6 @@ function axiosErrorMessage(err: unknown): string {
     return `❌ Connection error: \`${err.message}\``;
   }
   return "❌ Unknown error.";
-}
-
-function buildOutput(
-  lines: string[],
-  hostname: string,
-  suffix: string,
-  link: string,
-  summary: string
-): { buffer: Buffer; filename: string; tooLarge: false } | { tooLarge: true; fallback: Buffer; fallbackName: string; urls: string[] } {
-  const combined = lines.join("\n");
-  const buffer = Buffer.from(combined, "utf-8");
-  if (buffer.byteLength <= 8 * 1024 * 1024) {
-    return { buffer, filename: `${hostname}_${suffix}.txt`, tooLarge: false };
-  }
-  return { tooLarge: true, fallback: Buffer.from(`Content too large for Discord.\n${summary}`, "utf-8"), fallbackName: `${hostname}_${suffix}_urls.txt`, urls: [] };
 }
 
 // ─── /hmtl ───────────────────────────────────────────────────────────────────
@@ -327,6 +318,137 @@ async function handleCss(interaction: ChatInputCommandInteraction): Promise<void
   }
 }
 
+// ─── /assets ─────────────────────────────────────────────────────────────────
+
+interface AssetMap {
+  images: string[];
+  videos: string[];
+  audio: string[];
+  fonts: string[];
+  icons: string[];
+  other: string[];
+}
+
+function extractAssets(html: string, baseUrl: URL): AssetMap {
+  const assets: AssetMap = { images: [], videos: [], audio: [], fonts: [], icons: [], other: [] };
+
+  function resolveUrl(raw: string): string | null {
+    try { return new URL(raw, baseUrl).href; } catch { return null; }
+  }
+
+  function classify(urlStr: string): keyof AssetMap {
+    const lower = urlStr.toLowerCase().split("?")[0];
+    if (/\.(png|jpe?g|gif|webp|svg|bmp|ico|avif|tiff?)(\b|$)/.test(lower)) return "images";
+    if (/\.(mp4|webm|ogv|mov|avi|mkv)(\b|$)/.test(lower)) return "videos";
+    if (/\.(mp3|ogg|wav|flac|aac|m4a)(\b|$)/.test(lower)) return "audio";
+    if (/\.(woff2?|ttf|otf|eot)(\b|$)/.test(lower)) return "fonts";
+    if (/favicon|\.ico(\b|$)/.test(lower)) return "icons";
+    return "other";
+  }
+
+  function add(raw: string | null | undefined): void {
+    if (!raw || raw.startsWith("data:")) return;
+    const resolved = resolveUrl(raw.trim());
+    if (!resolved) return;
+    const cat = classify(resolved);
+    if (!assets[cat].includes(resolved)) assets[cat].push(resolved);
+  }
+
+  // <img src>
+  for (const m of html.matchAll(/<img[^>]+src=["']([^"']+)["']/gi)) add(m[1]);
+  // <img srcset>
+  for (const m of html.matchAll(/<img[^>]+srcset=["']([^"']+)["']/gi)) {
+    for (const part of m[1].split(",")) add(part.trim().split(/\s+/)[0]);
+  }
+  // <source src / srcset>
+  for (const m of html.matchAll(/<source[^>]+src=["']([^"']+)["']/gi)) add(m[1]);
+  for (const m of html.matchAll(/<source[^>]+srcset=["']([^"']+)["']/gi)) {
+    for (const part of m[1].split(",")) add(part.trim().split(/\s+/)[0]);
+  }
+  // <video src>
+  for (const m of html.matchAll(/<video[^>]+src=["']([^"']+)["']/gi)) add(m[1]);
+  // <audio src>
+  for (const m of html.matchAll(/<audio[^>]+src=["']([^"']+)["']/gi)) add(m[1]);
+  // <link rel="icon" / rel="preload" as="font" / rel="preload" as="image">
+  for (const m of html.matchAll(/<link[^>]+>/gi)) {
+    const tag = m[0];
+    const hrefM = tag.match(/href=["']([^"']+)["']/i);
+    if (!hrefM) continue;
+    const rel = (tag.match(/rel=["']([^"']+)["']/i) || [])[1] || "";
+    const as_ = (tag.match(/\bas=["']([^"']+)["']/i) || [])[1] || "";
+    if (/icon|apple-touch-icon/.test(rel)) { add(hrefM[1]); }
+    else if (rel === "preload" && (as_ === "font" || as_ === "image")) { add(hrefM[1]); }
+  }
+  // CSS url() in inline styles
+  for (const m of html.matchAll(/url\(["']?([^"')]+)["']?\)/gi)) add(m[1]);
+
+  return assets;
+}
+
+async function handleAssets(interaction: ChatInputCommandInteraction): Promise<void> {
+  const link = interaction.options.getString("link", true);
+  await interaction.deferReply();
+
+  const url = validateUrl(link);
+  if (!url) {
+    await interaction.editReply("❌ Invalid URL. Example: `https://example.com`");
+    return;
+  }
+
+  try {
+    await interaction.editReply("⏳ Scanning page for assets...");
+
+    const html = await fetchText(link);
+    const assets = extractAssets(html, url);
+
+    const total = Object.values(assets).reduce((a, b) => a + b.length, 0);
+    if (total === 0) {
+      await interaction.editReply("ℹ️ No assets found on this page.");
+      return;
+    }
+
+    const sep = "═".repeat(80);
+    const div = "─".repeat(80);
+    const lines: string[] = [
+      sep,
+      `ASSET SCAN — ${link}`,
+      `Generated: ${new Date().toISOString()}`,
+      `Total assets found: ${total}`,
+      `  Images: ${assets.images.length}  |  Videos: ${assets.videos.length}  |  Audio: ${assets.audio.length}`,
+      `  Fonts:  ${assets.fonts.length}   |  Icons:  ${assets.icons.length}   |  Other: ${assets.other.length}`,
+      sep, "",
+    ];
+
+    const sections: [keyof AssetMap, string][] = [
+      ["images", "IMAGES"],
+      ["videos", "VIDEOS"],
+      ["audio",  "AUDIO"],
+      ["fonts",  "FONTS"],
+      ["icons",  "ICONS"],
+      ["other",  "OTHER"],
+    ];
+
+    for (const [key, label] of sections) {
+      if (assets[key].length === 0) continue;
+      lines.push(div, `${label} (${assets[key].length})`, div, "");
+      assets[key].forEach((u, i) => lines.push(`${i + 1}. ${u}`));
+      lines.push("");
+    }
+
+    const buffer = Buffer.from(lines.join("\n"), "utf-8");
+    const hostname = url.hostname.replace(/[^a-zA-Z0-9.-]/g, "_");
+
+    await interaction.editReply({
+      content: `✅ Assets from \`${link}\` — ${total} total (${assets.images.length} images, ${assets.fonts.length} fonts, ${assets.videos.length} videos, ${assets.audio.length} audio, ${assets.icons.length} icons, ${assets.other.length} other)`,
+      files: [new AttachmentBuilder(buffer, { name: `${hostname}_assets.txt` })],
+    });
+
+    logger.info({ url: link, total }, "/assets success");
+  } catch (err) {
+    await interaction.editReply(axiosErrorMessage(err));
+  }
+}
+
 // ─── Start bot ───────────────────────────────────────────────────────────────
 
 export async function startBot(): Promise<void> {
@@ -342,9 +464,10 @@ export async function startBot(): Promise<void> {
 
   client.on("interactionCreate", async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
-    if (interaction.commandName === "hmtl") await handleHmtl(interaction);
-    if (interaction.commandName === "java") await handleJava(interaction);
-    if (interaction.commandName === "css") await handleCss(interaction);
+    if (interaction.commandName === "hmtl")   await handleHmtl(interaction);
+    if (interaction.commandName === "java")   await handleJava(interaction);
+    if (interaction.commandName === "css")    await handleCss(interaction);
+    if (interaction.commandName === "assets") await handleAssets(interaction);
   });
 
   client.on("error", (err) => {
