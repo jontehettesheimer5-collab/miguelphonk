@@ -1,0 +1,8 @@
+[phases.install]
+cmds = ["cd discord-bot && npm install"]
+
+[phases.build]
+cmds = []
+
+[start]
+cmd = "cd discord-bot && node index.mjs"
