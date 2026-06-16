@@ -111,6 +111,11 @@ export async function startBot(): Promise<void> {
   client.once("ready", async (c) => {
     logger.info({ tag: c.user.tag }, "Discord Bot eingeloggt");
     await registerCommands(c.user.id);
+
+    // Benötigte Berechtigungen: View Channels + Send Messages + Attach Files
+    const permissions = 1024 + 2048 + 32768; // 35840
+    const inviteUrl = `https://discord.com/oauth2/authorize?client_id=${c.user.id}&permissions=${permissions}&scope=bot%20applications.commands`;
+    logger.info({ inviteUrl }, "Bot Invite-Link");
   });
 
   client.on("interactionCreate", async (interaction) => {
