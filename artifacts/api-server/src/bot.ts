@@ -47,6 +47,12 @@ const commands = [
     .addStringOption((o) =>
       o.setName("link").setDescription("The URL to scan for assets").setRequired(true)
     ),
+  new SlashCommandBuilder()
+    .setName("full")
+    .setDescription("Returns all 4 files at once: HTML source, JavaScript, CSS, and asset list")
+    .addStringOption((o) =>
+      o.setName("link").setDescription("The URL to fully extract").setRequired(true)
+    ),
 ].map((cmd) => cmd.toJSON());
 
 async function registerCommands(clientId: string): Promise<void> {
@@ -449,6 +455,129 @@ async function handleAssets(interaction: ChatInputCommandInteraction): Promise<v
   }
 }
 
+// ─── /full ───────────────────────────────────────────────────────────────────
+
+async function buildHtmlBuffer(html: string): Promise<Buffer> {
+  return Buffer.from(html, "utf-8");
+}
+
+async function buildJsBuffer(html: string, baseUrl: URL): Promise<Buffer> {
+  const scriptSrcs = extractScriptSrcs(html, baseUrl);
+  const inlineScripts = extractInlineScripts(html);
+  const sep = "═".repeat(80), div = "─".repeat(80);
+  const lines: string[] = [
+    sep, `JS EXTRACTION — ${baseUrl.href}`, `Generated: ${new Date().toISOString()}`,
+    `External JS files: ${scriptSrcs.length}`, `Inline scripts: ${inlineScripts.length}`, sep, "",
+  ];
+  if (inlineScripts.length > 0) {
+    lines.push(div, `INLINE SCRIPTS (${inlineScripts.length})`, div, "");
+    inlineScripts.forEach((s, i) => lines.push(`// ── Inline #${i + 1} ──`, s, ""));
+  }
+  if (scriptSrcs.length > 0) {
+    lines.push(div, `EXTERNAL JS FILES (${scriptSrcs.length})`, div, "");
+    for (let i = 0; i < scriptSrcs.length; i++) {
+      lines.push(`// ── File #${i + 1}: ${scriptSrcs[i]} ──`);
+      try { lines.push(await fetchText(scriptSrcs[i], 10000), ""); }
+      catch (err) { lines.push(`// ⚠ Could not load: ${axiosErrorMessage(err)}`, ""); }
+    }
+  }
+  return Buffer.from(lines.join("\n"), "utf-8");
+}
+
+async function buildCssBuffer(html: string, baseUrl: URL): Promise<Buffer> {
+  const hrefs = extractStylesheetHrefs(html, baseUrl);
+  const inline = extractInlineStyles(html);
+  const sep = "═".repeat(80), div = "─".repeat(80);
+  const lines: string[] = [
+    sep, `CSS EXTRACTION — ${baseUrl.href}`, `Generated: ${new Date().toISOString()}`,
+    `External stylesheets: ${hrefs.length}`, `Inline styles: ${inline.length}`, sep, "",
+  ];
+  if (inline.length > 0) {
+    lines.push(div, `INLINE STYLES (${inline.length})`, div, "");
+    inline.forEach((s, i) => lines.push(`/* ── Inline #${i + 1} ── */`, s, ""));
+  }
+  if (hrefs.length > 0) {
+    lines.push(div, `EXTERNAL STYLESHEETS (${hrefs.length})`, div, "");
+    for (let i = 0; i < hrefs.length; i++) {
+      lines.push(`/* ── File #${i + 1}: ${hrefs[i]} ── */`);
+      try { lines.push(await fetchText(hrefs[i], 10000), ""); }
+      catch (err) { lines.push(`/* ⚠ Could not load: ${axiosErrorMessage(err)} */`, ""); }
+    }
+  }
+  return Buffer.from(lines.join("\n"), "utf-8");
+}
+
+function buildAssetsBuffer(html: string, baseUrl: URL): Buffer {
+  const assets = extractAssets(html, baseUrl);
+  const total = Object.values(assets).reduce((a, b) => a + b.length, 0);
+  const sep = "═".repeat(80), div = "─".repeat(80);
+  const lines: string[] = [
+    sep, `ASSET SCAN — ${baseUrl.href}`, `Generated: ${new Date().toISOString()}`, `Total assets: ${total}`,
+    `  Images: ${assets.images.length}  Videos: ${assets.videos.length}  Audio: ${assets.audio.length}`,
+    `  Fonts:  ${assets.fonts.length}   Icons:  ${assets.icons.length}   Other: ${assets.other.length}`,
+    sep, "",
+  ];
+  const sections: [keyof AssetMap, string][] = [
+    ["images","IMAGES"],["videos","VIDEOS"],["audio","AUDIO"],["fonts","FONTS"],["icons","ICONS"],["other","OTHER"],
+  ];
+  for (const [key, label] of sections) {
+    if (assets[key].length === 0) continue;
+    lines.push(div, `${label} (${assets[key].length})`, div, "");
+    assets[key].forEach((u, i) => lines.push(`${i + 1}. ${u}`));
+    lines.push("");
+  }
+  return Buffer.from(lines.join("\n"), "utf-8");
+}
+
+async function handleFull(interaction: ChatInputCommandInteraction): Promise<void> {
+  const link = interaction.options.getString("link", true);
+  await interaction.deferReply();
+
+  const url = validateUrl(link);
+  if (!url) {
+    await interaction.editReply("❌ Invalid URL. Example: `https://example.com`");
+    return;
+  }
+
+  try {
+    await interaction.editReply("⏳ Fetching page — extracting HTML, JS, CSS and assets...");
+
+    const html = await fetchText(link);
+    const hostname = url.hostname.replace(/[^a-zA-Z0-9.-]/g, "_");
+
+    const [htmlBuf, jsBuf, cssBuf] = await Promise.all([
+      buildHtmlBuffer(html),
+      buildJsBuffer(html, url),
+      buildCssBuffer(html, url),
+    ]);
+    const assetsBuf = buildAssetsBuffer(html, url);
+
+    const files: AttachmentBuilder[] = [];
+    const notes: string[] = [];
+    const limit = 8 * 1024 * 1024;
+
+    if (htmlBuf.byteLength <= limit)   files.push(new AttachmentBuilder(htmlBuf,   { name: `${hostname}_source.txt` }));
+    else notes.push("HTML too large");
+    if (jsBuf.byteLength <= limit)     files.push(new AttachmentBuilder(jsBuf,     { name: `${hostname}_scripts.txt` }));
+    else notes.push("JS too large");
+    if (cssBuf.byteLength <= limit)    files.push(new AttachmentBuilder(cssBuf,    { name: `${hostname}_styles.txt` }));
+    else notes.push("CSS too large");
+    if (assetsBuf.byteLength <= limit) files.push(new AttachmentBuilder(assetsBuf, { name: `${hostname}_assets.txt` }));
+    else notes.push("Assets too large");
+
+    const warning = notes.length > 0 ? ` ⚠️ Skipped (too large): ${notes.join(", ")}.` : "";
+
+    await interaction.editReply({
+      content: `✅ Full extraction of \`${link}\` — ${files.length}/4 files attached.${warning}`,
+      files,
+    });
+
+    logger.info({ url: link, files: files.length }, "/full success");
+  } catch (err) {
+    await interaction.editReply(axiosErrorMessage(err));
+  }
+}
+
 // ─── Start bot ───────────────────────────────────────────────────────────────
 
 export async function startBot(): Promise<void> {
@@ -468,6 +597,7 @@ export async function startBot(): Promise<void> {
     if (interaction.commandName === "java")   await handleJava(interaction);
     if (interaction.commandName === "css")    await handleCss(interaction);
     if (interaction.commandName === "assets") await handleAssets(interaction);
+    if (interaction.commandName === "full")   await handleFull(interaction);
   });
 
   client.on("error", (err) => {
