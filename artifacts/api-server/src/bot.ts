@@ -35,6 +35,12 @@ const commands = [
     .addStringOption((o) =>
       o.setName("link").setDescription("The URL to extract JavaScript from").setRequired(true)
     ),
+  new SlashCommandBuilder()
+    .setName("css")
+    .setDescription("Extracts all CSS (external stylesheets + inline styles) from a URL")
+    .addStringOption((o) =>
+      o.setName("link").setDescription("The URL to extract CSS from").setRequired(true)
+    ),
 ].map((cmd) => cmd.toJSON());
 
 async function registerCommands(clientId: string): Promise<void> {
@@ -71,6 +77,21 @@ function axiosErrorMessage(err: unknown): string {
     return `❌ Connection error: \`${err.message}\``;
   }
   return "❌ Unknown error.";
+}
+
+function buildOutput(
+  lines: string[],
+  hostname: string,
+  suffix: string,
+  link: string,
+  summary: string
+): { buffer: Buffer; filename: string; tooLarge: false } | { tooLarge: true; fallback: Buffer; fallbackName: string; urls: string[] } {
+  const combined = lines.join("\n");
+  const buffer = Buffer.from(combined, "utf-8");
+  if (buffer.byteLength <= 8 * 1024 * 1024) {
+    return { buffer, filename: `${hostname}_${suffix}.txt`, tooLarge: false };
+  }
+  return { tooLarge: true, fallback: Buffer.from(`Content too large for Discord.\n${summary}`, "utf-8"), fallbackName: `${hostname}_${suffix}_urls.txt`, urls: [] };
 }
 
 // ─── /hmtl ───────────────────────────────────────────────────────────────────
@@ -113,11 +134,7 @@ function extractScriptSrcs(html: string, baseUrl: URL): string[] {
   const srcRegex = /<script[^>]+src=["']([^"']+)["'][^>]*>/gi;
   let match: RegExpExecArray | null;
   while ((match = srcRegex.exec(html)) !== null) {
-    try {
-      srcs.push(new URL(match[1], baseUrl).href);
-    } catch {
-      // skip invalid URLs
-    }
+    try { srcs.push(new URL(match[1], baseUrl).href); } catch { /* skip */ }
   }
   return srcs;
 }
@@ -163,49 +180,35 @@ async function handleJava(interaction: ChatInputCommandInteraction): Promise<voi
       `Generated: ${new Date().toISOString()}`,
       `External JS files found: ${scriptSrcs.length}`,
       `Inline scripts found:    ${inlineScripts.length}`,
-      sep,
-      "",
+      sep, "",
     ];
 
     if (inlineScripts.length > 0) {
       lines.push(div, `INLINE SCRIPTS (${inlineScripts.length})`, div, "");
-      inlineScripts.forEach((script, i) => {
-        lines.push(`// ── Inline Script #${i + 1} ──`, script, "");
-      });
+      inlineScripts.forEach((s, i) => lines.push(`// ── Inline Script #${i + 1} ──`, s, ""));
     }
 
     if (scriptSrcs.length > 0) {
       lines.push(div, `EXTERNAL JS FILES (${scriptSrcs.length})`, div, "");
       for (let i = 0; i < scriptSrcs.length; i++) {
-        const src = scriptSrcs[i];
-        lines.push(`// ── File #${i + 1}: ${src} ──`);
-        try {
-          const jsContent = await fetchText(src, 10000);
-          lines.push(jsContent, "");
-        } catch (err) {
-          lines.push(`// ⚠ Could not load: ${axiosErrorMessage(err)}`, "");
-        }
+        lines.push(`// ── File #${i + 1}: ${scriptSrcs[i]} ──`);
+        try { lines.push(await fetchText(scriptSrcs[i], 10000), ""); }
+        catch (err) { lines.push(`// ⚠ Could not load: ${axiosErrorMessage(err)}`, ""); }
       }
     }
 
-    const combined = lines.join("\n");
-    const buffer = Buffer.from(combined, "utf-8");
+    const buffer = Buffer.from(lines.join("\n"), "utf-8");
     const hostname = url.hostname.replace(/[^a-zA-Z0-9.-]/g, "_");
 
     if (buffer.byteLength > 8 * 1024 * 1024) {
       const fallback = [
         `JS EXTRACTION (truncated) — ${link}`,
-        "Full content too large for Discord. Listing script URLs and inline scripts only.",
-        "",
-        `Script URLs (${scriptSrcs.length}):`,
+        "Full content too large for Discord. Listing script URLs only.",
+        "", `Script URLs (${scriptSrcs.length}):`,
         ...scriptSrcs.map((s, i) => `${i + 1}. ${s}`),
-        "",
-        `Inline Scripts (${inlineScripts.length}):`,
-        ...inlineScripts.map((s, i) => `\n// Script #${i + 1}\n${s}`),
       ].join("\n");
-
       await interaction.editReply({
-        content: `⚠️ Full content too large — here are the script URLs and inline scripts from \`${link}\``,
+        content: `⚠️ Full content too large — script URL list from \`${link}\``,
         files: [new AttachmentBuilder(Buffer.from(fallback, "utf-8"), { name: `${hostname}_scripts_urls.txt` })],
       });
       return;
@@ -217,6 +220,108 @@ async function handleJava(interaction: ChatInputCommandInteraction): Promise<voi
     });
 
     logger.info({ url: link, external: scriptSrcs.length, inline: inlineScripts.length }, "/java success");
+  } catch (err) {
+    await interaction.editReply(axiosErrorMessage(err));
+  }
+}
+
+// ─── /css ────────────────────────────────────────────────────────────────────
+
+function extractStylesheetHrefs(html: string, baseUrl: URL): string[] {
+  const hrefs: string[] = [];
+  const linkRegex = /<link[^>]+rel=["']stylesheet["'][^>]*>/gi;
+  const hrefRegex = /href=["']([^"']+)["']/i;
+  let match: RegExpExecArray | null;
+  while ((match = linkRegex.exec(html)) !== null) {
+    const hrefMatch = hrefRegex.exec(match[0]);
+    if (hrefMatch) {
+      try { hrefs.push(new URL(hrefMatch[1], baseUrl).href); } catch { /* skip */ }
+    }
+  }
+  return hrefs;
+}
+
+function extractInlineStyles(html: string): string[] {
+  const styles: string[] = [];
+  const styleRegex = /<style[^>]*>([\s\S]*?)<\/style>/gi;
+  let match: RegExpExecArray | null;
+  while ((match = styleRegex.exec(html)) !== null) {
+    const content = match[1].trim();
+    if (content.length > 0) styles.push(content);
+  }
+  return styles;
+}
+
+async function handleCss(interaction: ChatInputCommandInteraction): Promise<void> {
+  const link = interaction.options.getString("link", true);
+  await interaction.deferReply();
+
+  const url = validateUrl(link);
+  if (!url) {
+    await interaction.editReply("❌ Invalid URL. Example: `https://example.com`");
+    return;
+  }
+
+  try {
+    await interaction.editReply("⏳ Fetching page and extracting CSS...");
+
+    const html = await fetchText(link);
+    const stylesheetHrefs = extractStylesheetHrefs(html, url);
+    const inlineStyles = extractInlineStyles(html);
+
+    if (inlineStyles.length === 0 && stylesheetHrefs.length === 0) {
+      await interaction.editReply("ℹ️ No CSS found on this page.");
+      return;
+    }
+
+    const sep = "═".repeat(80);
+    const div = "─".repeat(80);
+    const lines: string[] = [
+      sep,
+      `CSS EXTRACTION — ${link}`,
+      `Generated: ${new Date().toISOString()}`,
+      `External stylesheets found: ${stylesheetHrefs.length}`,
+      `Inline styles found:        ${inlineStyles.length}`,
+      sep, "",
+    ];
+
+    if (inlineStyles.length > 0) {
+      lines.push(div, `INLINE STYLES (${inlineStyles.length})`, div, "");
+      inlineStyles.forEach((s, i) => lines.push(`/* ── Inline Style #${i + 1} ── */`, s, ""));
+    }
+
+    if (stylesheetHrefs.length > 0) {
+      lines.push(div, `EXTERNAL STYLESHEETS (${stylesheetHrefs.length})`, div, "");
+      for (let i = 0; i < stylesheetHrefs.length; i++) {
+        lines.push(`/* ── File #${i + 1}: ${stylesheetHrefs[i]} ── */`);
+        try { lines.push(await fetchText(stylesheetHrefs[i], 10000), ""); }
+        catch (err) { lines.push(`/* ⚠ Could not load: ${axiosErrorMessage(err)} */`, ""); }
+      }
+    }
+
+    const buffer = Buffer.from(lines.join("\n"), "utf-8");
+    const hostname = url.hostname.replace(/[^a-zA-Z0-9.-]/g, "_");
+
+    if (buffer.byteLength > 8 * 1024 * 1024) {
+      const fallback = [
+        `CSS EXTRACTION (truncated) — ${link}`,
+        "Full content too large for Discord. Listing stylesheet URLs only.",
+        "", `Stylesheet URLs (${stylesheetHrefs.length}):`,
+        ...stylesheetHrefs.map((s, i) => `${i + 1}. ${s}`),
+      ].join("\n");
+      await interaction.editReply({
+        content: `⚠️ Full content too large — stylesheet URL list from \`${link}\``,
+        files: [new AttachmentBuilder(Buffer.from(fallback, "utf-8"), { name: `${hostname}_styles_urls.txt` })],
+      });
+      return;
+    }
+
+    await interaction.editReply({
+      content: `✅ CSS from \`${link}\` — ${stylesheetHrefs.length} stylesheet(s), ${inlineStyles.length} inline style(s) (${(buffer.byteLength / 1024).toFixed(1)} KB)`,
+      files: [new AttachmentBuilder(buffer, { name: `${hostname}_styles.txt` })],
+    });
+
+    logger.info({ url: link, external: stylesheetHrefs.length, inline: inlineStyles.length }, "/css success");
   } catch (err) {
     await interaction.editReply(axiosErrorMessage(err));
   }
@@ -239,6 +344,7 @@ export async function startBot(): Promise<void> {
     if (!interaction.isChatInputCommand()) return;
     if (interaction.commandName === "hmtl") await handleHmtl(interaction);
     if (interaction.commandName === "java") await handleJava(interaction);
+    if (interaction.commandName === "css") await handleCss(interaction);
   });
 
   client.on("error", (err) => {
